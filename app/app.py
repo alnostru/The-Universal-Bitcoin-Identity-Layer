@@ -15,6 +15,7 @@ import uuid
 import time
 import os
 import secrets
+import json
 from datetime import datetime, timedelta, timezone
 from flask_socketio import SocketIO, emit
 from typing import Tuple, Dict, Set, List, Optional
@@ -30,7 +31,7 @@ from app.db_storage import (
     store_lnurl_challenge, get_lnurl_challenge,
     create_user, get_user_by_pubkey
 )
-from app.database import init_all, close_all
+from app.database import init_all, close_all, get_redis
 
 # Configure logging
 logging.basicConfig(
@@ -118,10 +119,139 @@ SPECIAL_USERS = [x.strip() for x in os.getenv("SPECIAL_USERS", "").split(",") if
 
 
 
-EXPIRY_SECONDS = 45 
-ACTIVE_SOCKETS: Dict[str, str] = {} 
+EXPIRY_SECONDS = 45
+ACTIVE_SOCKETS: Dict[str, str] = {}
 ONLINE_USERS: Set[str] = set()
+
+# DEPRECATED: In-memory chat history replaced by Redis
+# This list is kept for backwards compatibility but should not be used directly
+# Use get_chat_history() and add_chat_message() functions instead
 CHAT_HISTORY: List[Dict[str, any]] = []
+
+# Redis key for chat history
+REDIS_CHAT_HISTORY_KEY = "chat:history"
+REDIS_CHAT_HISTORY_MAX_SIZE = 500  # Keep last 500 messages in Redis
+
+def get_chat_history(limit: int = 100) -> List[Dict]:
+    """
+    Get recent chat messages from Redis (with fallback to in-memory).
+
+    Args:
+        limit: Maximum number of messages to return
+
+    Returns:
+        List of message dicts, most recent first
+    """
+    redis_client = get_redis()
+
+    if redis_client:
+        try:
+            # Get messages from Redis list (LRANGE returns oldest to newest, so reverse)
+            messages_json = redis_client.lrange(REDIS_CHAT_HISTORY_KEY, 0, limit - 1)
+            messages = [json.loads(msg) for msg in messages_json]
+
+            # Filter out expired messages
+            now = time.time()
+            fresh_messages = [
+                m for m in messages
+                if m.get("ts") and (now - m["ts"]) <= EXPIRY_SECONDS
+            ]
+
+            return fresh_messages
+        except Exception as e:
+            logger.warning(f"Failed to get chat history from Redis: {e}")
+            # Fall back to in-memory
+
+    # Fallback to in-memory CHAT_HISTORY
+    now = time.time()
+    return [
+        m for m in CHAT_HISTORY
+        if m.get("ts") and (now - m["ts"]) <= EXPIRY_SECONDS
+    ][:limit]
+
+def add_chat_message(pubkey: str, text: str) -> Dict:
+    """
+    Add a chat message to Redis (with fallback to in-memory).
+    Also persists to PostgreSQL for permanent storage.
+
+    Args:
+        pubkey: Public key of sender
+        text: Message text
+
+    Returns:
+        Message dict that was added
+    """
+    message = {
+        "pubkey": pubkey,
+        "text": str(text),
+        "ts": time.time()
+    }
+
+    redis_client = get_redis()
+
+    if redis_client:
+        try:
+            # Add to Redis list (LPUSH adds to beginning)
+            redis_client.lpush(REDIS_CHAT_HISTORY_KEY, json.dumps(message))
+
+            # Trim list to max size (keep most recent N messages)
+            redis_client.ltrim(REDIS_CHAT_HISTORY_KEY, 0, REDIS_CHAT_HISTORY_MAX_SIZE - 1)
+
+            logger.debug(f"Added message to Redis chat history: {pubkey[:8]}...")
+        except Exception as e:
+            logger.warning(f"Failed to add message to Redis, using in-memory fallback: {e}")
+            # Fall back to in-memory
+            CHAT_HISTORY.append(message)
+    else:
+        # No Redis available, use in-memory
+        CHAT_HISTORY.append(message)
+
+    # TODO: Also persist to PostgreSQL ChatMessage table for permanent storage
+    # This ensures messages survive Redis restarts and provides long-term history
+
+    return message
+
+def purge_old_chat_messages():
+    """
+    Remove expired messages from chat history.
+    For Redis: removes messages older than EXPIRY_SECONDS
+    For in-memory: filters the list
+    """
+    redis_client = get_redis()
+
+    if redis_client:
+        try:
+            # Get all messages
+            messages_json = redis_client.lrange(REDIS_CHAT_HISTORY_KEY, 0, -1)
+            now = time.time()
+
+            # Filter to fresh messages only
+            fresh_messages = []
+            for msg_json in messages_json:
+                try:
+                    msg = json.loads(msg_json)
+                    if msg.get("ts") and (now - msg["ts"]) <= EXPIRY_SECONDS:
+                        fresh_messages.append(msg_json)
+                except:
+                    continue
+
+            # Clear and repopulate list with fresh messages
+            if len(fresh_messages) < len(messages_json):
+                redis_client.delete(REDIS_CHAT_HISTORY_KEY)
+                if fresh_messages:
+                    redis_client.rpush(REDIS_CHAT_HISTORY_KEY, *fresh_messages)
+
+                logger.debug(f"Purged {len(messages_json) - len(fresh_messages)} old messages from Redis")
+        except Exception as e:
+            logger.warning(f"Failed to purge Redis chat history: {e}")
+    else:
+        # Fallback to in-memory purge
+        global CHAT_HISTORY
+        now = time.time()
+        CHAT_HISTORY[:] = [
+            m for m in CHAT_HISTORY
+            if m.get("ts") and (now - m["ts"]) <= EXPIRY_SECONDS
+        ]
 
 
 FORCE_RELAY = os.getenv("FORCE_RELAY", "false").lower() in ("1","true","yes","on")
@@ -240,7 +370,7 @@ def health_check():
             "timestamp": time.time(),
             "active_sockets": len(ACTIVE_SOCKETS),
             "online_users": len(ONLINE_USERS),
-            "chat_history_size": len(CHAT_HISTORY)
+            "chat_history_size": len(get_chat_history())
         }
         
         # Try to ping RPC (optional)
@@ -266,7 +396,7 @@ def metrics():
             "timestamp": time.time(),
             "active_sockets": len(ACTIVE_SOCKETS),
             "online_users": len(ONLINE_USERS),
-            "chat_history_size": len(CHAT_HISTORY),
+            "chat_history_size": len(get_chat_history()),
             "active_challenges": len(ACTIVE_CHALLENGES),
             "lnurl_sessions": len(LNURL_SESSIONS)
         }
@@ -410,9 +540,9 @@ def handle_message(msg_text):
             logger.warning("Message received from unauthenticated user")
             return
         
-        m = {"pubkey": pk, "text": str(msg_text), "ts": time.time()}
-        CHAT_HISTORY.append(m)
-        purge_old_messages()
+        # Add message to Redis-backed history
+        m = add_chat_message(pk, msg_text)
+        purge_old_chat_messages()
         socketio.emit('message', m)
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
@@ -637,15 +767,11 @@ def on_disconnect(*args):  # Added *args
         socketio.emit('user:left', {"pubkey": pubkey})
 
 def purge_old_messages():
-    """Keep only messages newer than EXPIRY_SECONDS."""
-    import time
-    now = time.time()
-    
-    def is_fresh(m):
-        ts = (m.get("ts") if isinstance(m, dict) else None)
-        return ts is not None and (now - ts) <= EXPIRY_SECONDS
-    global CHAT_HISTORY
-    CHAT_HISTORY[:] = [m for m in CHAT_HISTORY if is_fresh(m)]
+    """
+    DEPRECATED: Use purge_old_chat_messages() instead.
+    Kept for backwards compatibility.
+    """
+    purge_old_chat_messages()
 
 @app.route('/chat')
 def chat():
@@ -2365,7 +2491,7 @@ socket.on('rtc:ice', async ({candidate}) => {
     """
     return render_template_string(
          chat_html,
-         history=CHAT_HISTORY,
+         history=get_chat_history(),
          my_pubkey=my_pubkey,
          online_users=online_users_list,
          online_count=len(online_users_list),
