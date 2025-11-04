@@ -2994,11 +2994,17 @@ def verify_signature():
     socketio.emit('user:logged_in', matched_pubkey)
 
     print(f"[DEBUG] verify_signature → matched_pubkey={matched_pubkey}, access_level={session['access_level']}")
-    return jsonify({
+
+    # Create response and set OAuth cookies for convenience
+    response = jsonify({
         "verified":     True,
         "access_level": session['access_level'],
         "pubkey":       matched_pubkey
     })
+
+    # Set OAuth cookies using _finish_login helper
+    response = _finish_login(response, matched_pubkey, session['access_level'])
+    return response
 
 
 @app.route('/guest_login', methods=['POST'])
@@ -5631,61 +5637,6 @@ def special_login():
 
 
 
-# ---- Legacy message-signature verification (JSON-only) ----
-
-
-
-@app.route('/verify_signature', methods=['POST'])
-def verify_signature_legacy():
-    from flask import jsonify, request, session
-
-    data = request.get_json(silent=True) or {}
-    pubkey    = (data.get('pubkey') or '').strip()       # compressed hex (02/03...)
-    signature = (data.get('signature') or '').strip()    # wallet base64 (Electrum/Sparrow/Core)
-    challenge = (data.get('challenge') or '').strip()    # shown on the Legacy tab
-
-    # Basic input
-    if not signature or not challenge:
-        return jsonify(error="Missing signature or challenge"), 400
-
-    # Must match the session challenge injected into the Legacy tab
-    sess = session.get('challenge')
-    if not sess or sess != challenge:
-        return jsonify(error="Invalid or expired challenge"), 400
-
-    if not pubkey:
-        return jsonify(error="Pubkey required"), 400   # (can add recovery later if you want it optional)
-
-    # Verify like your API: derive legacy address from pubkey and ask Bitcoin Core to verify
-    try:
-        rpc  = get_rpc_connection()
-        addr = derive_legacy_address_from_pubkey(pubkey)
-        ok   = rpc.verifymessage(addr, signature, challenge)
-        if not ok:
-            return jsonify(error="Invalid signature"), 403
-    except Exception as e:
-        return jsonify(error=f"Signature verification failed: {e}"), 500
-
-    # Access level (same rule you use in /api/verify)
-    try:
-        in_total, out_total = get_save_and_check_balances_for_pubkey(pubkey)
-        ratio  = (out_total / in_total) if in_total > 0 else 0
-        access = 'full' if ratio >= 1 else 'limited'
-    except Exception:
-        access = 'limited'
-
-    # Set session / cookies exactly like API
-    payload = {
-        "verified": True,
-        "pubkey": pubkey,
-        "access_level": access,
-    }
-    resp = jsonify(payload)
-    resp = _finish_login(resp, pubkey, access)  # your helper used in /api/verify
-    return resp
-
-
-
 
 
 
@@ -5851,10 +5802,12 @@ JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
 ISSUER = os.getenv("OIDC_ISSUER", "https://hodlxxi.com").rstrip("/")
 AUDIENCE = os.getenv("OAUTH_AUDIENCE", "bitcoin-api")
 
-# memory stores; in prod you'd use Redis / DB
-CLIENT_STORE: Dict[str, dict] = {}
-AUTH_CODE_STORE: Dict[str, dict] = {}
-LNURL_SESSION_STORE: Dict[str, dict] = {}
+# DEPRECATED: In-memory stores replaced by PostgreSQL via db_storage
+# These dicts are kept for backwards compatibility but should not be used
+# All OAuth data now stored in PostgreSQL via db_storage.py functions
+CLIENT_STORE: Dict[str, dict] = {}  # DEPRECATED - use store_oauth_client() / get_oauth_client()
+AUTH_CODE_STORE: Dict[str, dict] = {}  # DEPRECATED - use store_oauth_code() / get_oauth_code()
+LNURL_SESSION_STORE: Dict[str, dict] = {}  # Still used for LNURL sessions (TODO: migrate to db_storage)
 
 LNURL_TTL = 300  # seconds
 
@@ -5927,85 +5880,64 @@ class ClientManager:
             redirect_uris=redirect_uris or []
         )
 
-        # Store in Redis (with fallback to in-memory)
+        # Store in PostgreSQL via db_storage
         try:
-            storage = get_storage()
-            # Import storage's ClientCredentials
-            from storage import ClientCredentials as RedisClient, ClientType as RedisClientType
-            
-            # Convert to Redis format
-            redis_client = RedisClient(
-                client_id=client.client_id,
-                client_secret=client.client_secret,
-                client_type=RedisClientType(client.client_type.value),
-                rate_limit=client.rate_limit,
-                allowed_scopes=client.allowed_scopes,
-                redirect_uris=client.redirect_uris,
-                created_at=client.created_at.timestamp(),
-                is_active=True
-            )
-            storage.store_client(redis_client)
-            logger.info(f"✅ Stored client in Redis: {client_id}")
-        except Exception as e:
-            logger.warning(f"⚠️  Redis unavailable, using in-memory: {e}")
-            CLIENT_STORE[client_id] = {
-                "client_id": client.client_id,
+            client_data = {
                 "client_secret": client.client_secret,
                 "client_type": client.client_type.value,
                 "rate_limit": client.rate_limit,
                 "allowed_scopes": list(client.allowed_scopes),
                 "redirect_uris": client.redirect_uris,
-                "payment_expiry": client.payment_expiry.isoformat() if client.payment_expiry else None,
-                "created_at": client.created_at.isoformat()
+                "payment_expiry": client.payment_expiry,
+                "created_at": client.created_at,
+                "is_active": True
             }
+            store_oauth_client(client.client_id, client_data)
+            logger.info(f"✅ Stored client in PostgreSQL: {client_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to store client in database: {e}")
+            raise
 
         return client
 
     @staticmethod
     def authenticate_client(client_id: str, client_secret: str) -> Optional[ClientCredentials]:
-        # Try Redis first
+        # Get client from PostgreSQL
         try:
-            storage = get_storage()
-            redis_client = storage.get_client(client_id)
-            if redis_client and redis_client.is_active:
-                if secrets.compare_digest(redis_client.client_secret, client_secret):
-                    # Convert back to app's ClientCredentials format
-                    return ClientCredentials(
-                        client_id=redis_client.client_id,
-                        client_secret=redis_client.client_secret,
-                        client_type=ClientType(redis_client.client_type.value),
-                        rate_limit=redis_client.rate_limit,
-                        allowed_scopes=redis_client.allowed_scopes,
-                        redirect_uris=redis_client.redirect_uris,
-                        payment_expiry=None,
-                        created_at=datetime.fromtimestamp(redis_client.created_at)
-                    )
-        except Exception as e:
-            logger.warning(f"⚠️  Redis lookup failed: {e}")
-        
-        # Fallback to in-memory
-        data = CLIENT_STORE.get(client_id)
-        if not data:
-            return None
-
-        if not secrets.compare_digest(data["client_secret"], client_secret):
-            return None
-
-        # payment_expiry check if present
-        if data.get("payment_expiry"):
-            if datetime.utcnow() > datetime.fromisoformat(data["payment_expiry"]):
+            data = get_oauth_client(client_id)
+            if not data:
                 return None
 
-        return ClientCredentials(
-            client_id=data["client_id"],
-            client_secret=data["client_secret"],
-            client_type=ClientType(data["client_type"]),
-            rate_limit=data["rate_limit"],
-            allowed_scopes=set(data["allowed_scopes"]),
-            redirect_uris=data.get("redirect_uris") or [],
-            payment_expiry=datetime.fromisoformat(data["payment_expiry"]) if data.get("payment_expiry") else None,
-            created_at=datetime.fromisoformat(data["created_at"])
-        )
+            # Verify client secret
+            if not secrets.compare_digest(data["client_secret"], client_secret):
+                return None
+
+            # Check if active
+            if not data.get("is_active", True):
+                return None
+
+            # Check payment expiry if present
+            if data.get("payment_expiry"):
+                expiry = data["payment_expiry"]
+                if isinstance(expiry, str):
+                    expiry = datetime.fromisoformat(expiry)
+                if datetime.utcnow() > expiry:
+                    return None
+
+            # Convert to ClientCredentials format
+            return ClientCredentials(
+                client_id=data["client_id"],
+                client_secret=data["client_secret"],
+                client_type=ClientType(data["client_type"]),
+                rate_limit=data.get("rate_limit", 100),
+                allowed_scopes=set(data.get("allowed_scopes", [])),
+                redirect_uris=data.get("redirect_uris", []),
+                payment_expiry=data.get("payment_expiry"),
+                created_at=data.get("created_at", datetime.utcnow())
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to authenticate client from database: {e}")
+            return None
 
 
 # ----------------------------------------------------------------------------
@@ -6022,30 +5954,18 @@ class OAuthServer:
                                state: str,
                                redirect_uri: str,
                                response_type: str = "code") -> dict:
-        # 1. validate client (try Redis first)
-        client_data = None
+        # 1. validate client from PostgreSQL
         try:
-            storage = get_storage()
-            redis_client = storage.get_client(client_id)
-            if redis_client and redis_client.is_active:
-                # Convert to dict format for this method
-                client_data = {
-                    "client_id": redis_client.client_id,
-                    "client_secret": redis_client.client_secret,
-                    "client_type": redis_client.client_type.value,
-                    "rate_limit": redis_client.rate_limit,
-                    "allowed_scopes": list(redis_client.allowed_scopes),
-                    "redirect_uris": redis_client.redirect_uris
-                }
+            client_data = get_oauth_client(client_id)
+            if not client_data:
+                return {"error": "invalid_client"}
+
+            # Check if active
+            if not client_data.get("is_active", True):
+                return {"error": "invalid_client"}
         except Exception as e:
-            logger.warning(f"⚠️  Redis lookup in authorize: {e}")
-        
-        # Fallback to in-memory
-        if not client_data:
-            client_data = CLIENT_STORE.get(client_id)
-        
-        if not client_data:
-            return {"error": "invalid_client"}
+            logger.error(f"❌ Failed to get client from database: {e}")
+            return {"error": "server_error"}
 
         # 2. validate requested scope ⊆ allowed_scopes
         requested_scopes = set(scope.split())
@@ -6074,14 +5994,13 @@ class OAuthServer:
             "expires_at": int(time.time()) + 600  # 10 min
         }
         
-        # Store in Redis (with fallback)
+        # Store in PostgreSQL via db_storage
         try:
-            storage = get_storage()
-            storage.store_auth_code(code, code_data, ttl=600)
-            logger.info(f"✅ Stored auth code in Redis: {code[:10]}...")
+            store_oauth_code(code, code_data)
+            logger.info(f"✅ Stored auth code in PostgreSQL: {code[:10]}...")
         except Exception as e:
-            logger.warning(f"⚠️  Redis code storage failed: {e}")
-            AUTH_CODE_STORE[code] = code_data
+            logger.error(f"❌ Failed to store auth code in database: {e}")
+            return {"error": "server_error"}
 
         # the Flask route can either:
         # - return redirect(f"{redirect_uri}?code=...&state=...")
@@ -6117,37 +6036,33 @@ class OAuthServer:
         return {"error": "unsupported_grant_type"}
 
     def _handle_code_grant(self, code: str, client: ClientCredentials) -> dict:
-        # Try Redis first (this also deletes the code - one-time use!)
-        code_data = None
+        # Get auth code from PostgreSQL
         try:
-            storage = get_storage()
-            code_data = storage.get_auth_code(code)  # Deletes from Redis
-            if code_data:
-                logger.info(f"✅ Retrieved auth code from Redis: {code[:10]}...")
+            code_data = get_oauth_code(code)
+            if not code_data:
+                return {"error": "invalid_grant", "detail": "code_not_found"}
+
+            logger.info(f"✅ Retrieved auth code from PostgreSQL: {code[:10]}...")
+
+            # Validate code
+            if code_data["client_id"] != client.client_id:
+                return {"error": "invalid_grant", "detail": "client_mismatch"}
+
+            if code_data["expires_at"] < int(time.time()):
+                return {"error": "invalid_grant", "detail": "code_expired"}
+
+            scope_str = code_data["scope"]
+
+            access_token  = self._gen_access(client, scope_str)
+            refresh_token = self._gen_refresh(client.client_id, scope_str)
+
+            # One-time use: delete the code after successful exchange
+            delete_oauth_code(code)
+            logger.info(f"✅ Deleted used auth code: {code[:10]}...")
+
         except Exception as e:
-            logger.warning(f"⚠️  Redis code retrieval failed: {e}")
-        
-        # Fallback to in-memory
-        if not code_data:
-            code_data = AUTH_CODE_STORE.get(code)
-        
-        if not code_data:
-            return {"error": "invalid_grant", "detail": "code_not_found"}
-
-        if code_data["client_id"] != client.client_id:
-            return {"error": "invalid_grant", "detail": "client_mismatch"}
-
-        if code_data["expires_at"] < int(time.time()):
-            return {"error": "invalid_grant", "detail": "code_expired"}
-
-        scope_str = code_data["scope"]
-
-        access_token  = self._gen_access(client, scope_str)
-        refresh_token = self._gen_refresh(client.client_id, scope_str)
-
-        # one-time use
-        # Delete from in-memory if it was there (Redis auto-deleted)
-        AUTH_CODE_STORE.pop(code, None)
+            logger.error(f"❌ Failed to handle code grant: {e}")
+            return {"error": "server_error"}
 
         return {
             "access_token": access_token,
